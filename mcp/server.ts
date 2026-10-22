@@ -53,10 +53,12 @@ function checkAuth(req: http.IncomingMessage): boolean {
   );
 }
 
-const server = new McpServer({
-  name: "ziwei-mcp",
-  version: "0.1.0",
-});
+/** 每次构建全新 server 实例（无状态模式需要；stdio 也用同一工厂） */
+function makeServer() {
+  const s = new McpServer({ name: "ziwei-mcp", version: "0.1.0" });
+  registerTools(s);
+  return s;
+}
 
 /** "YYYY-MM-DD HH:MM" → 数字元组 */
 function parseBirth(birth: string) {
@@ -124,8 +126,9 @@ function compactChart(chart: ReturnType<typeof generateChart>) {
   };
 }
 
-// ── Tool 1: 完整命盘 ─────────────────────────────────────────
-server.tool(
+// ── Tool 注册 ────────────────────────────────────────────────
+function registerTools(s: McpServer) {
+s.tool(
   "ziwei_chart",
   "紫微斗数排盘：输入公历出生时间和性别，返回十二宫星曜（含亮度/四化）、五行局、命宫身宫、命主身主、农历信息与四柱。用户提到紫微斗数、排盘、命盘、星曜时使用。",
   BirthSchema,
@@ -142,7 +145,7 @@ server.tool(
 );
 
 // ── Tool 2: 大限（十年运）───────────────────────────────────
-server.tool(
+s.tool(
   "ziwei_daxian",
   "紫微斗数大限排布：返回每个十年大限的起止年龄、落宫、宫干四化。分析运势、十年运、大限时使用。",
   BirthSchema,
@@ -167,7 +170,7 @@ server.tool(
 );
 
 // ── Tool 3: 格局 + 命宫摘要 ─────────────────────────────────
-server.tool(
+s.tool(
   "ziwei_patterns",
   "紫微斗数格局检测与命宫摘要：检测命盘成立的格局（如君臣庆会、火贪格等）并给出命宫简评。解读命盘、论格局时使用。",
   BirthSchema,
@@ -188,30 +191,44 @@ server.tool(
   },
 );
 
+}
+
 // ── 启动 ─────────────────────────────────────────────────────
 async function main() {
   if (process.argv.includes("--http")) {
     const port = +process.argv[process.argv.indexOf("--http") + 1] || 8766;
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-    });
-    await server.connect(transport);
-  http
-    .createServer(async (req, res) => {
-      if (!req.url?.startsWith("/mcp")) {
-        res.writeHead(404).end();
-        return;
-      }
-      if (!checkAuth(req)) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized: missing/invalid license key" }));
-        return;
-      }
-      await transport.handleRequest(req, res);
-    })
-      .listen(port, "0.0.0.0", () => console.log(`ziwei-mcp listening on http://0.0.0.0:${port}/mcp`));
+    // 无状态模式: 每请求独立 server + transport, 支持多客户端并发
+    http
+      .createServer(async (req, res) => {
+        if (!req.url?.startsWith("/mcp")) {
+          res.writeHead(404).end();
+          return;
+        }
+        if (!checkAuth(req)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "unauthorized: missing/invalid license key" }));
+          return;
+        }
+        try {
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+            enableJsonResponse: true,
+          });
+          res.on("close", () => {
+            transport.close();
+          });
+          await makeServer().connect(transport);
+          await transport.handleRequest(req, res);
+        } catch (e) {
+          console.error("request error:", e);
+          if (!res.headersSent) {
+            res.writeHead(500).end(JSON.stringify({ error: "internal error" }));
+          }
+        }
+      })
+      .listen(port, "0.0.0.0", () => console.log(`ziwei-mcp (stateless) listening on http://0.0.0.0:${port}/mcp`));
   } else {
-    await server.connect(new StdioServerTransport());
+    await makeServer().connect(new StdioServerTransport());
     console.error("ziwei-mcp running on stdio");
   }
 }
